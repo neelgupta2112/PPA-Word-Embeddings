@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
-
+from itertools import islice
 
 def extract_usage_representations(text, target_words, tokenizer, model, device="cpu"):
     encoded = tokenizer(text, return_tensors="pt", return_offsets_mapping=True, truncation=True)
@@ -33,7 +33,7 @@ MODEL_NAME = "GroNLP/bert-base-modern"  # Replace with actual ModernBERT name
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE).eval()
 
-target_words = []
+target_words = ['ballad', 'poem', 'era', 'sounds']
 TARGET_COLLECTIONS = {"Literary", "Linguistic"}
 
 with open("data/ppa_metadata.json") as f:
@@ -47,7 +47,7 @@ metadata_index = {
 # Process corpus
 output = []
 with open("data/corpus.jsonl") as f:
-    for line in tqdm(f):
+    for line in tqdm(islice(f, 1000))
         example = json.loads(line)
         text = example.get("text")
         sid = example.get("source_id")
