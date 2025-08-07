@@ -109,7 +109,6 @@ while True:
             output_batch.append({
                 "word": word,
                 "usage_vector": usage_vector.tolist(),
-                "text": text,
                 "id": pid,
                 "work_id": wid,
                 })
