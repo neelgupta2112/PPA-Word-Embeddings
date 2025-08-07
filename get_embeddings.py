@@ -18,6 +18,8 @@ def extract_usage_representations(text, tokenizer, model, device="cpu"):
 
     all_layers = torch.stack(hidden_states, dim=0)  # Shape: (layers, batch, seq_len, hidden) ## grabbing the layers 
     summed = all_layers.sum(dim=0)[0]  # sum across layers → (seq_len, hidden_size) ## sum all hidden layers
+    # summed = all_layers[-4:].sum(dim=0)[0] maybe SUM ONLY LAST 4 LAYERS?? A lot of papers do this for BERT but 4 seems random and model specific
+
 
     # Map tokens to words (simple tokenizer-based match)
     tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
