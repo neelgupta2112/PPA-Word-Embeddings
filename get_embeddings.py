@@ -99,7 +99,7 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
             continue
 
         # detect new word
-        is_new_word = token.startswith("Ġ") or i == 0
+        is_new_word = token.startswith("Ġ") or i == 0 or token.startswith("Ċ")
 
         if is_new_word and current_word:
             # aggregate previous word
@@ -119,7 +119,7 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
             current_vecs = []
 
         if is_new_word:
-            current_word = token.lstrip("Ġ")
+            current_word = token.lstrip("ĠĊ")
             current_start = offsets[i][0].item()
             current_end = offsets[i][1].item()
             current_vecs.append(summed[i])
