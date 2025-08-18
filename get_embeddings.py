@@ -5,6 +5,7 @@ from itertools import islice
 import json
 import os
 import gzip
+import string
 
 
 # def is_semantically_meaningful(token):
@@ -61,6 +62,7 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
         return_offsets_mapping=True,
         truncation=True
     )
+    
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
     offsets = encoded["offset_mapping"][0]
@@ -86,9 +88,9 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
     current_end = None
 
     STOPWORDS = {
-        "the", "and", "for", "but", "with", "that", "this", "from", "not",
-        "you", "are", "was", "were", "have", "has", "had", "she", "he", "they",
-        "his", "her", "its", "our", "their", "will", "would", "can", "could"
+       "the", "and", "for", "but", "with", "that", "this", "from", "not",
+      "you", "are", "was", "were", "have", "has", "had", "she", "he", "they",
+       "his", "her", "its", "our", "their", "will", "would", "can", "could"
     }
 
     for i, token in enumerate(tokens):
@@ -96,42 +98,49 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
         if token in special_tokens:
             continue
 
-        # detect new word (RoBERTa-style)
+        # detect new word
         is_new_word = token.startswith("Ġ") or i == 0
 
         if is_new_word and current_word:
             # aggregate previous word
             word_vec = torch.stack(current_vecs).mean(dim=0)
-            if not skip_stopwords or current_word.lower() not in STOPWORDS:
+
+            # strip punctuation + lowercase
+            clean_word = current_word.lower().strip(string.punctuation)
+
+            if clean_word and (not skip_stopwords or clean_word not in STOPWORDS):
                 usage_vectors.append({
-                    "word": current_word.lower(),
+                    "word": clean_word,
                     "vector": word_vec.cpu(),
                     "char_start": current_start,
                     "char_end": current_end
                 })
+
             current_vecs = []
 
         if is_new_word:
             current_word = token.lstrip("Ġ")
             current_start = offsets[i][0].item()
             current_end = offsets[i][1].item()
-            start_idx = i
             current_vecs.append(summed[i])
         else:
             current_word += token
             current_end = offsets[i][1].item()
             current_vecs.append(summed[i])
 
-    # add last word
+    # Handle last word
     if current_word:
         word_vec = torch.stack(current_vecs).mean(dim=0)
-        if not skip_stopwords or current_word.lower() not in STOPWORDS:
+        clean_word = current_word.lower().strip(string.punctuation)
+        if clean_word and (not skip_stopwords or clean_word not in STOPWORDS):
             usage_vectors.append({
-                "word": current_word.lower(),
+                "word": clean_word,
                 "vector": word_vec.cpu(),
                 "char_start": current_start,
                 "char_end": current_end
             })
+
+    return usage_vectors
 
 
 def page_iter(pages_file):
