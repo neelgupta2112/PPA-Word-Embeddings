@@ -83,10 +83,14 @@ dataset = Dataset.from_generator(lambda: pages_generator("Data/ppa_corpus_2025-0
 block_size = 512
 
 def tokenize_and_chunk(examples):
-    tokenized = tokenizer(examples["text"], return_attention_mask=False, return_token_type_ids=False)
-    input_ids = tokenized["input_ids"]
-    chunks = [input_ids[i:i+block_size] for i in range(0, len(input_ids), block_size) if len(input_ids[i:i+block_size]) == block_size]
-    return {"input_ids": chunks}
+    return tokenizer(
+        examples["text"],
+        truncation=True,
+        padding="max_length",   # pad short texts up to block_size
+        max_length=block_size,
+        return_attention_mask=True,
+        return_token_type_ids=False,
+    )
 
 tokenized_dataset = dataset.map(tokenize_and_chunk, batched=True, remove_columns=["text"])
 tokenized_dataset = tokenized_dataset.flatten() 
@@ -103,6 +107,7 @@ training_args = TrainingArguments(
     logging_strategy="steps",
     logging_steps=100, ## PARAM
     fp16=torch.cuda.is_available(),
+    remove_unused_columns=False,
 )
 
 trainer = Trainer(
