@@ -1,11 +1,9 @@
 import torch
+import math
 from transformers import AutoTokenizer, AutoModelForMaskedLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 from tqdm import tqdm
-from itertools import islice
 import json
-import os
 import gzip
-import string
 from datasets import Dataset
 
 def page_iter(pages_file):
@@ -13,21 +11,16 @@ def page_iter(pages_file):
        for line in fh:
            yield json.loads(line)
 
-
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_id = "answerdotai/ModernBERT-base"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForMaskedLM.from_pretrained(model_id).to(DEVICE)
 
-
 TARGET_COLLECTIONS = {"Literary"}
 EXCLUSION_COLLECTIONS = {"Dictionary", "Word Lists", "Typographically Unique"}
 
-
 with open("Data/ppa_corpus_2025-02-03_1308/ppa_metadata.json") as f:
     metadata = json.load(f)
-
 
 metadata_index = {
     entry["work_id"]: entry
@@ -37,36 +30,7 @@ metadata_index = {
        and not any(c in EXCLUSION_COLLECTIONS for c in entry["collections"])
 }
 
-
-
-print(len(metadata_index))
-
-
-
-# total_tokens = 0
-# total_chunks = 0
-# block_size = 512
-
-# for page in tqdm(page_iter("Data/ppa_corpus_2025-02-03_1308/ppa_pages.jsonl.gz"), desc="Counting tokens"):
-#     wid = page.get("work_id")
-#     if wid not in metadata_index:
-#         continue
-
-#     text = page.get("text", "").strip()
-#     if not text:
-#         continue
-
-#     tokens = tokenizer(text, return_attention_mask=False, return_token_type_ids=False)["input_ids"]
-#     n_tokens = len(tokens)
-#     total_tokens += n_tokens
-#     total_chunks += n_tokens // block_size  # full blocks only
-
-# print(f"Total tokens: {total_tokens:,}")
-# print(f"Total 512-token chunks: {total_chunks:,}")
-# print(f"Avg tokens per eligible source: {total_tokens / len(metadata_index):.0f}")
-
-
-
+print(f"Eligible works: {len(metadata_index)}")
 
 def pages_generator(file, allowed_ids):
     with gzip.open(file, 'rt', encoding='utf-8') as f:
@@ -77,7 +41,10 @@ def pages_generator(file, allowed_ids):
             if wid in allowed_ids and text:
                 yield {"text": text}
 
-dataset = Dataset.from_generator(lambda: pages_generator("Data/ppa_corpus_2025-02-03_1308/ppa_pages.jsonl.gz", metadata_index.keys()))
+dataset = Dataset.from_generator(lambda: pages_generator(
+    "Data/ppa_corpus_2025-02-03_1308/ppa_pages.jsonl.gz",
+    metadata_index.keys())
+)
 
 ### PARAM
 block_size = 512
@@ -86,26 +53,31 @@ def tokenize_and_chunk(examples):
     return tokenizer(
         examples["text"],
         truncation=True,
-        padding="max_length",   # pad short texts up to block_size
+        padding="max_length",
         max_length=block_size,
         return_attention_mask=True,
         return_token_type_ids=False,
     )
 
 tokenized_dataset = dataset.map(tokenize_and_chunk, batched=True, remove_columns=["text"])
-tokenized_dataset = tokenized_dataset.flatten() 
+tokenized_dataset = tokenized_dataset.flatten()
 
-collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15) #PARAM
+# Split into train/validation
+dataset_split = tokenized_dataset.train_test_split(test_size=0.1, seed=25)
+train_dataset = dataset_split["train"]
+eval_dataset = dataset_split["test"]
 
+collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
 
 training_args = TrainingArguments(
     output_dir="./modernbert-literary-mlm",
-    per_device_train_batch_size=16, ##PARAM
-    num_train_epochs=3,  ## PARAM
-    learning_rate=5e-5, ## PARAM
+    per_device_train_batch_size=16,
+    num_train_epochs=2,
+    learning_rate=2.5e-5,
     save_strategy="epoch",
+    evaluation_strategy="epoch",
     logging_strategy="steps",
-    logging_steps=100, ## PARAM
+    logging_steps=500,
     fp16=torch.cuda.is_available(),
     remove_unused_columns=False,
 )
@@ -113,14 +85,25 @@ training_args = TrainingArguments(
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_dataset,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
     tokenizer=tokenizer,
     data_collator=collator,
 )
 
+### Evaluate baseline
+baseline_metrics = trainer.evaluate()
+baseline_perplexity = math.exp(baseline_metrics["eval_loss"])
+print(f"\nBaseline perplexity: {baseline_perplexity:.2f}\n")
 
+### Train
 trainer.train()
 
+### Evaluate finetuned model
+finetuned_metrics = trainer.evaluate()
+finetuned_perplexity = math.exp(finetuned_metrics["eval_loss"])
+print(f"\nFinetuned perplexity: {finetuned_perplexity:.2f}\n")
 
+### Save model + tokenizer
 trainer.save_model("./finetuned_modernbert-literary-mlm")
-tokenizer.save_pretrained("./fintuned_modernbert-literary-mlm")
+tokenizer.save_pretrained("./finetuned_modernbert-literary-mlm")
