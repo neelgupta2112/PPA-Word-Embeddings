@@ -1,5 +1,6 @@
-torch
-transformers
-tqdm
-datasets
-umap
+
+
+torch>=2.0
+transformers>=4.40
+datasets>=2.15
+tqdm>=4.65
