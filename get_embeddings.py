@@ -6,6 +6,8 @@ import json
 import os
 import gzip
 import string
+import boto3
+from io import BytesIO
 
 
 # def is_semantically_meaningful(token):
@@ -151,24 +153,34 @@ def page_iter(pages_file):
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_id = "answerdotai/ModernBERT-base"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModel.from_pretrained(model_id)
+model_dir = "./finetuned_modernbert-literary-mlm"
+tokenizer = AutoTokenizer.from_pretrained(model_dir)
+model = AutoModel.from_pretrained(model_dir).to(DEVICE)
+
+S3_BUCKET = "ppa-embeddings-bucket"  # <-- change this to your actual bucket name
+S3_PREFIX = "embeddings/"             # folder prefix inside the bucket
+s3 = boto3.client("s3", region_name="us-west-2")
 
 TARGET_COLLECTIONS = {"Literary", "Linguistic"}
+EXCLUSION_COLLECTIONS = {"Dictionary", "Word Lists", "Original Bibliography"}
 
 with open("Data/ppa_corpus_2025-02-03_1308/ppa_metadata.json") as f:
     metadata = json.load(f)
 
 metadata_index = {
-    entry["source_id"]: entry for entry in metadata
-    if "collections" in entry and any(c in TARGET_COLLECTIONS for c in entry["collections"])
+    entry["work_id"]: entry
+    for entry in metadata
+    if "collections" in entry
+    and any(c in TARGET_COLLECTIONS for c in entry["collections"])
+    and not any(c in EXCLUSION_COLLECTIONS for c in entry["collections"])
 }
 
+print(len(metadata_index))
 
 
 
-BATCH_SIZE = 1000
+
+BATCH_SIZE = 200
 MAX_PAGES = None  
 OUTPUT_DIR = "output_batches"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -178,16 +190,20 @@ batch_idx = 0
 total_processed = 0
 
 while True:
+    print(total_processed)
     batch = list(islice(page_generator, BATCH_SIZE))
     if not batch:
         break
+    s3_key = f"{S3_PREFIX}usage_batch_{batch_idx:05}.jsonl.gz"
 
-    output_path = f"{OUTPUT_DIR}/usage_batch_{batch_idx:05}.jsonl.gz"
-    if os.path.exists(output_path):
-        print(f"Skipping batch {batch_idx}, already exists.")
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
+        print(f"Skipping batch {batch_idx}, already exists on S3.")
         batch_idx += 1
         total_processed += len(batch)
         continue
+    except s3.exceptions.ClientError:
+        pass
 
     output_batch = []
 
@@ -212,11 +228,18 @@ while True:
                 "id": pid,
                 "work_id": wid,
                 })
-
-    output_path = f"{OUTPUT_DIR}/usage_batch_{batch_idx:05}.jsonl.gz"
-    with gzip.open(output_path, "wt", encoding="utf-8") as f_out:
+            
+    buffer = BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="w") as gz_out:
         for item in output_batch:
-            f_out.write(json.dumps(item) + "\n")
+            gz_out.write((json.dumps(item) + "\n").encode("utf-8"))
+
+    buffer.seek(0)
+    s3.upload_fileobj(buffer, S3_BUCKET, s3_key)
+    print(f"✅ Uploaded batch {batch_idx} to s3://{S3_BUCKET}/{s3_key}")
+
+    del output_batch
+    torch.cuda.empty_cache()
 
     batch_idx += 1
     total_processed += len(batch)
