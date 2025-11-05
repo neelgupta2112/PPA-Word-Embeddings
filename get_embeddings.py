@@ -8,6 +8,8 @@ import gzip
 import string
 import boto3
 from io import BytesIO
+import gc
+import threading
 
 
 # def is_semantically_meaningful(token):
@@ -69,7 +71,7 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
     attention_mask = encoded["attention_mask"].to(device)
     offsets = encoded["offset_mapping"][0]
 
-    with torch.no_grad():
+    with torch.inference_mode():
         output = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -77,8 +79,7 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
         )
         hidden_states = output.hidden_states  # (layers, batch, seq_len, hidden_size)
 
-    all_layers = torch.stack(hidden_states, dim=0)  # (layers, batch, seq_len, hidden)
-    summed = all_layers.sum(dim=0)[0]  # (seq_len, hidden_size)
+    summed = sum(hidden_states[-4:])[0]   # (seq_len, hidden_size)
 
     tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
     special_tokens = set(tokenizer.all_special_tokens)
@@ -113,7 +114,7 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
             if clean_word and (not skip_stopwords or clean_word not in STOPWORDS):
                 usage_vectors.append({
                     "word": clean_word,
-                    "vector": word_vec.cpu(),
+                    "vector": word_vec.detach().cpu().numpy(),
                     "char_start": current_start,
                     "char_end": current_end
                 })
@@ -137,7 +138,7 @@ def extract_usage_representations(text, tokenizer, model, device="cpu", skip_sto
         if clean_word and (not skip_stopwords or clean_word not in STOPWORDS):
             usage_vectors.append({
                 "word": clean_word,
-                "vector": word_vec.cpu(),
+                "vector": word_vec.detach().cpu().numpy(),
                 "char_start": current_start,
                 "char_end": current_end
             })
@@ -150,15 +151,33 @@ def page_iter(pages_file):
        for line in fh:
            yield json.loads(line)
 
+def page_iter_filtered(pages_file, metadata_index):
+    with gzip.open(pages_file, 'rt', encoding='utf-8') as fh:
+        for line in fh:
+            page = json.loads(line)
+            if page.get("work_id") in metadata_index:
+                yield page
+def upload_to_s3(buffer, key):
+    """
+    Uploads a file buffer to S3 in a background thread.
+    Keeps main loop running while upload proceeds.
+    """
+    try:
+        s3.upload_fileobj(buffer, S3_BUCKET, key)
+        print(f"✅ Uploaded {key}")
+    except Exception as e:
+        print(f"❌ Upload failed for {key}: {e}")
+
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model_dir = "./finetuned_modernbert-literary-mlm"
 tokenizer = AutoTokenizer.from_pretrained(model_dir)
 model = AutoModel.from_pretrained(model_dir).to(DEVICE)
+model = torch.compile(model)
 
 S3_BUCKET = "ppa-embeddings-bucket"  # <-- change this to your actual bucket name
-S3_PREFIX = "embeddings/"             # folder prefix inside the bucket
+S3_PREFIX = "embeddings_3/"             # folder prefix inside the bucket
 s3 = boto3.client("s3", region_name="us-west-2")
 
 TARGET_COLLECTIONS = {"Literary", "Linguistic"}
@@ -185,7 +204,7 @@ MAX_PAGES = None
 OUTPUT_DIR = "output_batches"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-page_generator = page_iter("Data/ppa_corpus_2025-02-03_1308/ppa_pages.jsonl.gz")
+page_generator = page_iter_filtered("Data/ppa_corpus_2025-02-03_1308/ppa_pages.jsonl.gz", metadata_index)
 batch_idx = 0
 total_processed = 0
 
@@ -206,28 +225,46 @@ while True:
         pass
 
     output_batch = []
-
+    batch = [ex for ex in batch if ex.get("text")]
     for example in tqdm(batch, desc=f"Batch {batch_idx}"):
         text = example.get("text")
         pid = example.get("id")
         wid = example.get("work_id")
 
-        if not text or wid not in metadata_index:
-            continue
+        # if not text or wid not in metadata_index:
+            # continue
         meta = metadata_index[wid]
         pub_year = meta.get("pub_year")
         collections = meta.get("collections")
 
-        for word_info in extract_usage_representations(text, tokenizer, model, device=DEVICE):
-            word = word_info['word']
-            output_batch.append({
-                "word": word,
-                "usage_vector": word_info["vector"].tolist(),
-                "char_start": word_info["char_start"],
-                "char_end": word_info["char_end"], 
-                "id": pid,
-                "work_id": wid,
-                })
+        with torch.cuda.amp.autocast():
+            usage_vecs = extract_usage_representations(text, tokenizer, model, device=DEVICE)
+        
+
+        batch_records = [
+        {
+            "word": w["word"],
+            "usage_vector": w["vector"].tolist(),
+            "char_start": w["char_start"],
+            "char_end": w["char_end"],
+            "id": pid,
+            "work_id": wid,
+        }
+        for w in usage_vecs
+    ]
+        
+    output_batch.extend(batch_records)
+
+        # for word_info in extract_usage_representations(text, tokenizer, model, device=DEVICE):
+        #     word = word_info['word']
+        #     output_batch.append({
+        #         "word": word,
+        #         "usage_vector": word_info["vector"].tolist(),
+        #         "char_start": word_info["char_start"],
+        #         "char_end": word_info["char_end"], 
+        #         "id": pid,
+        #         "work_id": wid,
+        #         })
             
     buffer = BytesIO()
     with gzip.GzipFile(fileobj=buffer, mode="w") as gz_out:
@@ -235,14 +272,18 @@ while True:
             gz_out.write((json.dumps(item) + "\n").encode("utf-8"))
 
     buffer.seek(0)
-    s3.upload_fileobj(buffer, S3_BUCKET, s3_key)
-    print(f"✅ Uploaded batch {batch_idx} to s3://{S3_BUCKET}/{s3_key}")
+    s3_key = f"{S3_PREFIX}usage_batch_{batch_idx:05}.jsonl.gz"
+    threading.Thread(target=upload_to_s3, args=(buffer, s3_key)).start()
+    # s3.upload_fileobj(buffer, S3_BUCKET, s3_key)
+    # print(f"✅ Uploaded batch {batch_idx} to s3://{S3_BUCKET}/{s3_key}")
 
     del output_batch
-    torch.cuda.empty_cache()
+    if batch_idx % 50 == 0:
+        torch.cuda.empty_cache()
+        gc.collect()
+
 
     batch_idx += 1
     total_processed += len(batch)
-    if MAX_PAGES and total_processed >= MAX_PAGES:
-        break
+print("Embeddings all captured")
 
