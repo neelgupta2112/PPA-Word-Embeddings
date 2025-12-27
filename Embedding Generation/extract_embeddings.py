@@ -7,7 +7,6 @@ import random
 import pandas as pd
 from tqdm import tqdm
 import numpy as np
-import altair as alt
 import ast
 from collections import defaultdict
 from tqdm import tqdm
@@ -130,6 +129,8 @@ for form, stats in all_other_records.items():
 
 df_selected = pd.read_parquet(SELECTED_PARQUET)
 
+other_rows.to_csv("most_common_words.csv", index = False)
+print("Wrote most_common_words.csv")
 # ---------- WRITE TO CSV IN MEMORY ----------
 csv_buffer = StringIO()
 df_selected.to_csv(csv_buffer, index=False)
