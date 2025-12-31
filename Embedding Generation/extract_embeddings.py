@@ -1,153 +1,357 @@
-
-import json
-import gzip
-from io import BytesIO
-import boto3
-import random
+import torch
+from transformers import AutoTokenizer, AutoModel
 import pandas as pd
 from tqdm import tqdm
-import numpy as np
-import ast
-from collections import defaultdict
-from tqdm import tqdm
-import pyarrow as pa
-import pyarrow.parquet as pq
-from io import StringIO
+import json, gzip, os, string, boto3
+import polars as pl
 
-keyword_db = pd.read_parquet("../Data/ppa_corpus_2025-02-03_1308/keywords_and_top_1000_edited.parquet")
-forms = keyword_db[~keyword_db['page_text'].isna()]['poetic_form'].unique()
-del keyword_db
-
-TARGET_FORMS = set(forms)
-
-EMBEDDING_DTYPE = np.float32
-
-SELECTED_PARQUET = "selected_forms.parquet"
-SELECTED_CSV = "selected_forms.csv"
-OTHER_CSV = "other_forms_avg.csv"
-
-
-
+# ---------------- CONFIG ----------------
+MODEL_DIR = "../finetuned_modernbert-literary-mlm"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 S3_BUCKET = "ppa-embeddings-bucket"
-S3_INPUT_PREFIX = "target_embeddings_expanded/"       
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id="AKIAYQNJSRWCQL32G6XW",
-    aws_secret_access_key="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",
-    region_name="us-west-2"
+S3_PREFIX = "target_embeddings_expanded/"
+LOCAL_TMP = "tmp_batches"
+CONTEXT_CHARS = 100
+BATCH_SIZE = 200
+
+os.makedirs(LOCAL_TMP, exist_ok=True)
+s3 = boto3.client("s3")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+model = AutoModel.from_pretrained(MODEL_DIR).to(DEVICE)
+model = torch.compile(model)
+
+STOPWORDS = {
+    "the", "and", "for", "but", "with", "that", "this", "from", "not",
+    "you", "are", "was", "were", "have", "has", "had", "she", "he", "they",
+    "his", "her", "its", "our", "their", "will", "would", "can", "could"
+}
+
+# ---------------- LOAD DATA ----------------
+print("loading data")
+# df = pd.read_parquet(
+#     "../Data/ppa_corpus_2025-02-03_1308/keywords_and_top_1000_edited.parquet",
+#     columns=["page_id", "poetic_form", "spelling", "page_text", "work_id"]
+# )
+# print("loaded data")
+# # df = df[["page_id", "poetic_form", "spelling", "page_text", "work_id"]] # "title", "author", "pub_year"]]
+
+# # map form -> list of spellings
+# form_to_spellings = {
+#     f: [s.lower().strip(string.punctuation) for s in spellings]
+#     for f, spellings in df.groupby("poetic_form")["spelling"].agg(list).items()
+# }
+
+# print("form to spelling done")
+
+# # ---------------- GROUP BY PAGE ----------------
+# pages = df.groupby("page_id", sort=False).agg({
+#     "page_text": "first",
+#     "spelling": lambda x: list(x),
+#     "work_id": "first",
+#     # "title": "first",
+#     # "author": "first",
+#     # "pub_year": "first"
+# }).reset_index()
+
+
+df = pl.read_parquet(
+    "../Data/ppa_corpus_2025-02-03_1308/keywords_and_top_1000_edited.parquet",
+    columns=["page_id", "poetic_form", "spelling", "page_text", "work_id"]
+)
+print("loaded data")
+
+
+df_clean = df.with_columns(
+    pl.col("spelling")
+      .str.to_lowercase()
+      .str.strip_chars(string.punctuation)
 )
 
+df_unique = df_clean.select(["poetic_form", "spelling"]).unique()
 
+df_unique_pd = df_unique.to_pandas()
 
-def stream_jsonl_gz_from_s3(s3_client, bucket, key):
-    """
-    Stream a .jsonl.gz file from S3 and yield dicts.
-    """
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
-    with gzip.GzipFile(fileobj=obj["Body"], mode="r") as gz:
-        for line in gz:
-            yield json.loads(line)
+form_to_spellings = {
+    f: [s.lower().strip(string.punctuation) for s in spellings]
+    for f, spellings in df_unique_pd.groupby("poetic_form")["spelling"].agg(list).items()
+}
 
-
-
-all_other_records = defaultdict(lambda: {
-    "sum": None,
-    "count": 0
-})
-
-def update_other(form, embedding):
-    emb = np.asarray(embedding, dtype=EMBEDDING_DTYPE)
-    if all_other_records[form]["sum"] is None:
-        all_other_records[form]["sum"] = emb.copy()
-    else:
-        all_other_records[form]["sum"] += emb
-    all_other_records[form]["count"] += 1
-
-
-selected_writer = None
-
-def write_selected(row):
-    global selected_writer
-    table = pa.Table.from_pylist([row])
-
-    if selected_writer is None:
-        selected_writer = pq.ParquetWriter(
-            SELECTED_PARQUET,
-            table.schema,
-            compression="zstd"
-        )
-
-    selected_writer.write_table(table)
+del df_unique
+del df_unique_pd
+del df_clean
 
 
 
-paginator = s3.get_paginator("list_objects_v2")
 
-for page in paginator.paginate(
-    Bucket=S3_BUCKET,
-    Prefix=S3_INPUT_PREFIX
-):
-    for obj in tqdm(
-        page.get("Contents", []),
-        desc="Reading S3 JSONL.GZ files"
-    ):
-        key = obj["Key"]
-        if not key.endswith(".jsonl.gz"):
+print("form to spelling done")
+
+pages = (
+    df
+    .group_by("page_id", maintain_order=True)
+    .agg([
+        pl.col("page_text").first(),
+        pl.col("spelling").implode(),
+        pl.col("work_id").first(),
+    ])
+)
+
+del df
+
+
+pages=pages.to_pandas()
+
+
+print("pages done")
+
+# targets now only contain spellings
+pages["targets"] = pages["spelling"].tolist()
+pages = pages.drop(columns=["spelling"])
+print(f"✅ Unique pages to embed: {len(pages)}")
+
+
+def page_iter(pages_file):
+   # Yield pages one at a time from gzipped JSON lines file for memory efficiency
+   with gzip.open(pages_file, 'rt', encoding='utf-8') as fh:
+       for line in fh:
+           yield json.loads(line)
+
+
+# ---------------- HELPER ----------------
+def extract_usage_representations(text, tokenizer, model, device="cpu", skip_stopwords=True):
+    encoded = tokenizer(text, return_tensors="pt", return_offsets_mapping=True, truncation=False)
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    offsets = encoded["offset_mapping"][0]
+
+    with torch.inference_mode():
+        output = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        hidden_states = output.hidden_states
+
+    summed = sum(hidden_states[-4:])[0]
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+    special_tokens = set(tokenizer.all_special_tokens)
+
+    usage_vectors = []
+    current_word, current_vecs = "", []
+    current_start, current_end = None, None
+
+    for i, token in enumerate(tokens):
+        if token in special_tokens:
             continue
+        is_new_word = token.startswith("Ġ") or i == 0 or token.startswith("Ċ")
+        if is_new_word and current_word:
+            word_vec = torch.stack(current_vecs).mean(dim=0)
+            clean_word = current_word.lower().strip(string.punctuation)
+            if clean_word and (not skip_stopwords or clean_word not in STOPWORDS):
+                usage_vectors.append({
+                    "word": clean_word,
+                    "vector": word_vec.detach().cpu().numpy(),
+                    "char_start": current_start,
+                    "char_end": current_end
+                })
+            current_vecs = []
+        if not current_vecs:  # first real subtoken of the current word
+            current_start = offsets[i][0].item()
 
-        for record in stream_jsonl_gz_from_s3(s3, S3_BUCKET, key):
-            form = record.get("poetic_form")
-            embedding = record.get("embedding")
+        if is_new_word:
+            current_word = token.lstrip("ĠĊ")
+            current_start = offsets[i][0].item()
+            current_end = offsets[i][1].item()
+            current_vecs.append(summed[i])
+        else:
+            current_word += token
+            current_end = offsets[i][1].item()
+            current_vecs.append(summed[i])
 
-            if form is None or embedding is None:
-                continue  # skip malformed rows
+    if current_word:
+        word_vec = torch.stack(current_vecs).mean(dim=0)
+        clean_word = current_word.lower().strip(string.punctuation)
+        if clean_word and (not skip_stopwords or clean_word not in STOPWORDS):
+            usage_vectors.append({
+                "word": clean_word,
+                "vector": word_vec.detach().cpu().numpy(),
+                "char_start": current_start,
+                "char_end": current_end
+            })
+    return usage_vectors
 
-            if form in TARGET_FORMS:
-                write_selected(record)
-            else:
-                update_other(form, embedding)
+def s3_object_exists(bucket, key):
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3.exceptions.ClientError:
+        return False
+    
 
+page_ids_to_keep = set(pages["page_id"])  # your pages_df
 
+num_batches = (len(pages) + BATCH_SIZE - 1) // BATCH_SIZE
+print("number of batches:" + str(num_batches))
 
-if selected_writer is not None:
-    selected_writer.close()
+batch = []
+batch_idx = 0
 
-
-other_rows = []
-
-for form, stats in all_other_records.items():
-    if stats["count"] == 0:
+for example in tqdm(page_iter("../Data/ppa_corpus_2025-02-03_1308/ppa_pages.jsonl.gz"), desc="Streaming pages"):
+    page_id = example.get("id")
+    if page_id not in page_ids_to_keep:
         continue
 
-    avg_embedding = (stats["sum"] / stats["count"]).tolist()
-
-    other_rows.append({
-        "poetic_form": form,
-        "embedding": avg_embedding
+    # attach metadata from pages_df
+    row = pages[pages['page_id'] == page_id].iloc[0]
+    text = example.get("text")
+    target_spellings = {s.lower().strip(string.punctuation) for s in row["targets"]}
+    work_id = row["work_id"]
+    batch.append({
+        "page_id": page_id,
+        "text": text,
+        "work_id": work_id,
+        "target_spellings": target_spellings, 
+        # keep full row if you need other metadata
     })
 
+    # Process batch if full
+    if len(batch) >= BATCH_SIZE:
+        print(str(batch_idx) + "is full")
+        local_path = os.path.join(LOCAL_TMP, f"batch_{batch_idx:05d}.jsonl.gz")
+        with gzip.open(local_path, "wt") as f_out:
+            for item in batch:
+                all_usages = extract_usage_representations(item["text"], tokenizer, model, device=DEVICE)
+                for u in all_usages:
+                    if u["word"] in item["target_spellings"]:
+                        start = u["char_start"]
+                        end = u["char_end"]
+                        left = max(0, start - CONTEXT_CHARS)
+                        right = min(len(item["text"]), end + CONTEXT_CHARS)
+                        context_snippet = item["text"][left:right]
 
-df_selected = pd.read_parquet(SELECTED_PARQUET)
+                        # map spelling back to a form
+                        form_candidates = [
+                            f for f, spellings in form_to_spellings.items()
+                            if u["word"] in [s.lower() for s in spellings]
+                        ]
+                        form_value = form_candidates[0] if form_candidates else None
 
-other_rows.to_csv("most_common_words.csv", index = False)
-print("Wrote most_common_words.csv")
-# ---------- WRITE TO CSV IN MEMORY ----------
-csv_buffer = StringIO()
-df_selected.to_csv(csv_buffer, index=False)
-s3.put_object(
-    Bucket=S3_BUCKET,
-    Key="processed/selected_forms.csv",  # S3 path
-    Body=csv_buffer.getvalue()
-)
+                        json_obj = {
+                            "page_id": item["page_id"],
+                            "work_id": item["work_id"],
+                            "poetic_form": form_value,
+                            "spelling": u["word"],
+                            "char_start": start,
+                            "char_end": end,
+                            "context": context_snippet,
+                            "embedding": u["vector"].tolist()
+                        }
+                        f_out.write(json.dumps(json_obj) + "\n")
 
-csv_buffer = StringIO()
-pd.DataFrame(other_rows).to_csv(csv_buffer, index=False)
+        # upload to S3 and cleanup
+        s3_key = f"{S3_PREFIX}batch_{batch_idx:05d}.jsonl.gz"
+        if not s3_object_exists(S3_BUCKET, s3_key):
+            s3.upload_file(local_path, S3_BUCKET, s3_key)
+        os.remove(local_path)
+        print(f"✅ Uploaded {s3_key}")
 
-s3.put_object(
-    Bucket=S3_BUCKET,
-    Key="processed/other_forms_avg.csv",  
-    Body=csv_buffer.getvalue()
-)
+        batch_idx += 1
+        batch = []
 
-print(f"Selected forms written to: {SELECTED_CSV}")
-print(f"Other forms written to: {OTHER_CSV}")
+# process leftover batch
+if batch:
+    local_path = os.path.join(LOCAL_TMP, f"batch_{batch_idx:05d}.jsonl.gz")
+    with gzip.open(local_path, "wt") as f_out:
+        for item in batch:
+            all_usages = extract_usage_representations(item["text"], tokenizer, model, device=DEVICE)
+            for u in all_usages:
+                if u["word"] in item["target_spellings"]:
+                    start = u["char_start"]
+                    end = u["char_end"]
+                    left = max(0, start - CONTEXT_CHARS)
+                    right = min(len(item["text"]), end + CONTEXT_CHARS)
+                    context_snippet = item["text"][left:right]
+
+                    form_candidates = [
+                        f for f, spellings in form_to_spellings.items()
+                        if u["word"] in [s.lower() for s in spellings]
+                    ]
+                    form_value = form_candidates[0] if form_candidates else None
+
+                    json_obj = {
+                        "page_id": item["page_id"],
+                        "work_id": item["work_id"],
+                        "poetic_form": form_value,
+                        "spelling": u["word"],
+                        "char_start": start,
+                        "char_end": end,
+                        "context": context_snippet,
+                        "embedding": u["vector"].tolist()
+                    }
+                    f_out.write(json.dumps(json_obj) + "\n")
+
+    s3_key = f"{S3_PREFIX}batch_{batch_idx:05d}.jsonl.gz"
+    if not s3_object_exists(S3_BUCKET, s3_key):
+        s3.upload_file(local_path, S3_BUCKET, s3_key)
+    os.remove(local_path)
+    print(f"✅ Uploaded {s3_key}")
+print("🎉 All batches complete and uploaded to S3.")
+
+
+
+
+# # ---------------- MAIN LOOP ----------------
+# num_batches = (len(pages) + BATCH_SIZE - 1) // BATCH_SIZE
+# print("number of batches:" + str(num_batches))
+
+
+
+# for batch_idx in range(num_batches):
+#     s3_key = f"{S3_PREFIX}batch_{batch_idx:05d}.jsonl.gz"
+#     if s3_object_exists(S3_BUCKET, s3_key):
+#         print(f"🟡 Skipping existing batch {batch_idx}")
+#         continue
+
+#     start = batch_idx * BATCH_SIZE
+#     end = min((batch_idx + 1) * BATCH_SIZE, len(pages))
+#     batch_pages = pages.iloc[start:end]
+#     local_path = os.path.join(LOCAL_TMP, f"batch_{batch_idx:05d}.jsonl.gz")
+
+#     with gzip.open(local_path, "wt") as f_out:
+#         for _, row in tqdm(batch_pages.iterrows(), total=len(batch_pages), desc=f"Batch {batch_idx}"):
+#             text = row["page_text"]
+#             print(text)
+#             target_spellings = {s.lower().strip(string.punctuation) for s in row["targets"]}
+#             page_id = row["page_id"]
+
+#             all_usages = extract_usage_representations(text, tokenizer, model, device=DEVICE)
+
+#             for u in all_usages:
+#                 if u["word"] in target_spellings:
+#                     start = u["char_start"]
+#                     end = u["char_end"]
+
+#                     left = max(0, start - CONTEXT_CHARS)
+#                     right = min(len(text), end + CONTEXT_CHARS)
+#                     context_snippet = text[left:right]
+
+#                     # map spelling back to a form (pick the first form that contains this spelling)
+#                     form_candidates = [f for f, spellings in form_to_spellings.items() if u["word"] in [s.lower() for s in spellings]]
+#                     form_value = form_candidates[0] if form_candidates else None
+
+#                     json_obj = {
+#                         "page_id": page_id,
+#                         "work_id": row["work_id"],
+#                         # "title": row["title"],
+#                         # "author": row["author"],
+#                         # "pub_year": row["pub_year"],
+#                         "poetic_form": form_value,
+#                         "spelling": u["word"],
+#                         "char_start": start,
+#                         "char_end": end,
+#                         "context": context_snippet,
+#                         "embedding": u["vector"].tolist()
+#                     }
+#                     f_out.write(json.dumps(json_obj) + "\n")
+
+#     s3.upload_file(local_path, S3_BUCKET, s3_key)
+#     os.remove(local_path)
+#     print(f"✅ Uploaded {s3_key}")
+
+# print("🎉 All batches complete and uploaded to S3.")
