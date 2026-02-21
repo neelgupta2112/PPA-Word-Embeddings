@@ -1,1 +1,4 @@
 /Data
+filtered_ppa_corpus.csv
+.DS_Store
+/topic-model-output/ppa-100-topics_all
